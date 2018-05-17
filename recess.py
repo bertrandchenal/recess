@@ -66,29 +66,20 @@ class TextParser(HTMLParser):
                          'form', 'html', 'body', 'path', 'style'])
         super().__init__()
 
-    def record(self):
-        el = self.stack[-1]
-        key = tuple(i.name for i in self.stack)
-        print(key, el.content[:30])
-        self.rows.append((key, el.content))
-
     def handle_starttag(self, tag, attrs):
-        self.stack.append(Element(tag, attrs))
+        el = Element(tag, attrs)
+        self.stack.append(el)
+        key = tuple(i.name for i in self.stack)
+        self.rows.append((key, el))
 
     def handle_endtag(self, tag):
         # Consume stack until a matching tag is found (caused by
         # dangling open tags)
         while True:
             leaf_name = self.stack and self.stack[-1].name
+            self.stack.pop()
             if not leaf_name or tag == leaf_name:
                 break
-            print('SKIP', leaf_name)
-            self.stack.pop()
-        if not self.stack:
-            return
-
-        self.record()
-        self.stack.pop()
 
     def handle_data(self, content):
         content = content.strip()
@@ -103,13 +94,13 @@ class TextParser(HTMLParser):
 
     def topN(self, n=3):
         scores = defaultdict(list)
-        for k, content in self.rows:
-            scores[k].append(len(content))
+        for k, el in self.rows:
+            scores[k].append(len(el.content))
         board = [(sum(s)/len(s), k) for k, s in scores.items()]
         keep = set(k for s, k in  sorted(board)[-n:])
-        for k, content in self.rows:
+        for k, el in self.rows:
             if k in keep:
-                yield content
+                yield el.content
 
     @classmethod
     def get_text(cls, link):
@@ -124,7 +115,7 @@ class TextParser(HTMLParser):
         source = resp.read().decode('utf-8', 'ignore')
         tp = TextParser()
         tp.feed(source)
-        return '\n'.join(tp.topN(3))
+        return '\n'.join(tp.topN(10))
 
 
 class RSSParser(HTMLParser):
