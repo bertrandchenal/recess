@@ -1,3 +1,4 @@
+from textwrap import wrap
 from collections import OrderedDict, defaultdict
 from html.parser import HTMLParser
 from urllib import request
@@ -6,12 +7,12 @@ import urllib
 from tanker import connect, View, yaml_load, create_tables
 import dateutil
 
-# Add proxy support
-proxy = request.ProxyHandler({
-    'http': 'http://proxy.eib.electrabel.be:8080',
-    'https': 'http://proxy.eib.electrabel.be:8080',
-})
-request.install_opener(request.build_opener(proxy))
+# # Add proxy support
+# proxy = request.ProxyHandler({
+#     'http': 'http://proxy.eib.electrabel.be:8080',
+#     'https': 'http://proxy.eib.electrabel.be:8080',
+# })
+# request.install_opener(request.build_opener(proxy))
 
 schema = '''
 - table: feed
@@ -27,6 +28,7 @@ schema = '''
     pubdate: timestamp
     title: varchar
     description: varchar
+    text: varchar
     extra: jsonb
   key:
     - link
@@ -67,18 +69,26 @@ class TextParser(HTMLParser):
     def record(self):
         el = self.stack[-1]
         key = tuple(i.name for i in self.stack)
+        print(key, el.content[:30])
         self.rows.append((key, el.content))
 
     def handle_starttag(self, tag, attrs):
         self.stack.append(Element(tag, attrs))
 
     def handle_endtag(self, tag):
-        TODO pop stak until `tag` is encountered
+        # Consume stack until a matching tag is found (caused by
+        # dangling open tags)
+        while True:
+            leaf_name = self.stack and self.stack[-1].name
+            if not leaf_name or tag == leaf_name:
+                break
+            print('SKIP', leaf_name)
+            self.stack.pop()
+        if not self.stack:
+            return
+
         self.record()
         self.stack.pop()
-        print(key)
-        print(tag)
-        assert tag == leaf.name
 
     def handle_data(self, content):
         content = content.strip()
@@ -111,7 +121,7 @@ class TextParser(HTMLParser):
         if not content_type.startswith('text/html'):
             return None
 
-        source = resp.read().decode('utf-8')
+        source = resp.read().decode('utf-8', 'ignore')
         tp = TextParser()
         tp.feed(source)
         return '\n'.join(tp.topN(3))
@@ -144,13 +154,6 @@ class RSSParser(HTMLParser):
             if leaf.name in ('title', 'link', 'pubdate', 'description'):
                 if leaf.name == 'pubdate':
                     leaf.content = dateutil.parser.parse(leaf.content)
-                elif leaf.name == 'link':
-                    link = leaf.content
-                    print('\n ----\n')
-                    print(link)
-                    text = TextParser.get_text(link)
-                    print(text and text[:100])
-                    self.item_info['text'] = text
                 self.item_info[leaf.name] = leaf.content
             else:
                 extra = self.item_info.setdefault('extra', {})
@@ -173,19 +176,44 @@ class RSSParser(HTMLParser):
         leaf.content += content
 
 if __name__ == '__main__':
-    resp = request.urlopen('https://news.ycombinator.com/rss')
-    source = resp.read().decode('utf-8')
-    parser = RSSParser()
-    parser.feed(source)
+    # resp = request.urlopen('https://news.ycombinator.com/rss')
+    # source = resp.read().decode('utf-8')
+    # parser = RSSParser()
+    # parser.feed(source)
+    # min_pubdate = min(i['pubdate'] for i in parser.items)
 
-    import pdb;pdb.set_trace()
     with connect(cfg):
         create_tables()
-        View('feed_item', {
-            'title': 'title',
-            'link': 'link',
-            'pubdate': 'pubdate',
-            'description': 'description',
-            'extra': 'extra',
-            # TODO add feed.link
-        }).write(parser.items)
+
+        # # Collect linked pages content
+        # in_db = set(l for l, in View('feed_item', ['link']).read())
+        # for item in parser.items:
+        #     link = item['link']
+        #     if link in in_db:
+        #         continue
+        #     else:
+        #         print('Load %s' % link)
+        #         text = TextParser.get_text(link)
+        #         item['text'] = text
+        # # Update db
+        # View('feed_item', {
+        #     'title': 'title',
+        #     'link': 'link',
+        #     'pubdate': 'pubdate',
+        #     'description': 'description',
+        #     'text': 'text',
+        #     'extra': 'extra',
+        #     # TODO add feed.link
+        # }).write(parser.items)
+
+        # for link, txt in View('feed_item', ['link', 'text']).read():
+        #     print('\n\n', link)
+        #     if not txt:
+        #         continue
+        #     for line in txt.splitlines():
+        #         if not line.strip():
+        #             continue
+        #         print('\n\t' + '\n\t'.join(wrap(line)))
+
+        text = TextParser.get_text('https://news.ycombinator.com/item?id=17093538')
+        print(text)
