@@ -30,7 +30,7 @@ schema = '''
 '''
 
 cfg = {
-    'db_uri': 'postgresql:///test',
+    'db_uri': 'sqlite:///test.db',
     'schema': yaml_load(schema),
 }
 
@@ -163,7 +163,7 @@ class RSSParser(HTMLParser):
         leaf.content += content
 
 
-def enable_proxy():
+def auto_proxy():
     # Add proxy support
     handlers = {}
     for variable in ('http_proxy', 'https_proxy'):
@@ -178,46 +178,46 @@ def enable_proxy():
 
 
 if __name__ == '__main__':
-    # resp = request.urlopen('https://news.ycombinator.com/rss')
-    # source = resp.read().decode('utf-8')
-    # parser = RSSParser()
-    # parser.feed(source)
-    # min_pubdate = min(i['pubdate'] for i in parser.items)
+    resp = request.urlopen('https://news.ycombinator.com/rss')
+    source = resp.read().decode('utf-8')
+    parser = RSSParser()
+    parser.feed(source)
+    min_pubdate = min(i['pubdate'] for i in parser.items)
 
-    # enable_proxy()
+    auto_proxy()
 
-    # with connect(cfg):
-    #     create_tables()
+    with connect(cfg):
+        create_tables()
 
-        # # Collect linked pages content
-        # in_db = set(l for l, in View('feed_item', ['link']).read())
-        # for item in parser.items:
-        #     link = item['link']
-        #     if link in in_db:
-        #         continue
-        #     else:
-        #         print('Load %s' % link)
-        #         text = TextParser.get_text(link)
-        #         item['text'] = text
-        # # Update db
-        # View('feed_item', {
-        #     'title': 'title',
-        #     'link': 'link',
-        #     'pubdate': 'pubdate',
-        #     'description': 'description',
-        #     'text': 'text',
-        #     'extra': 'extra',
-        #     # TODO add feed.link
-        # }).write(parser.items)
+        # Collect linked pages content
+        in_db = set(l for l, in View('feed_item', ['link']).read())
+        for item in parser.items:
+            link = item['link']
+            if link in in_db:
+                continue
+            else:
+                print('Load %s' % link)
+                text = TextParser.get_text(link)
+                item['text'] = text
+        # Update db
+        View('feed_item', {
+            'title': 'title',
+            'link': 'link',
+            'pubdate': 'pubdate',
+            'description': 'description',
+            'text': 'text',
+            'extra': 'extra',
+            # TODO add feed.link
+        }).write(parser.items)
 
-        # for link, txt in View('feed_item', ['link', 'text']).read():
-        #     print('\n\n', link)
-        #     if not txt:
-        #         continue
-        #     for line in txt.splitlines():
-        #         if not line.strip():
-        #             continue
-        #         print('\n\t' + '\n\t'.join(wrap(line)))
+        for link, txt in View('feed_item', ['link', 'text']).read():
+            print('\n\n', link)
+            if not txt:
+                continue
+            for line in txt.splitlines():
+                if not line.strip():
+                    continue
+                print('\n\t' + '\n\t'.join(wrap(line)))
 
-    text = TextParser.get_text('https://stackoverflow.com/questions/21619468/curl-returns-unknown-protocol')
-    print(text)
+    # text = TextParser.get_text('https://stackoverflow.com/questions/21619468/curl-returns-unknown-protocol')
+    # print(text)
