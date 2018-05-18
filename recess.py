@@ -1,3 +1,4 @@
+import os
 from textwrap import wrap
 from collections import OrderedDict, defaultdict
 from html.parser import HTMLParser
@@ -7,12 +8,6 @@ import urllib
 from tanker import connect, View, yaml_load, create_tables
 import dateutil
 
-# # Add proxy support
-# proxy = request.ProxyHandler({
-#     'http': 'http://proxy.eib.electrabel.be:8080',
-#     'https': 'http://proxy.eib.electrabel.be:8080',
-# })
-# request.install_opener(request.build_opener(proxy))
 
 schema = '''
 - table: feed
@@ -76,9 +71,10 @@ class TextParser(HTMLParser):
         # Consume stack until a matching tag is found (caused by
         # dangling open tags)
         while True:
-            leaf_name = self.stack and self.stack[-1].name
-            self.stack.pop()
-            if not leaf_name or tag == leaf_name:
+            if not self.stack:
+                return
+            leaf = self.stack.pop()
+            if tag == leaf.name:
                 break
 
     def handle_data(self, content):
@@ -166,6 +162,21 @@ class RSSParser(HTMLParser):
         leaf = self.stack[-1]
         leaf.content += content
 
+
+def enable_proxy():
+    # Add proxy support
+    handlers = {}
+    for variable in ('http_proxy', 'https_proxy'):
+        value = os.environ.get('http_proxy')
+        if not value:
+            continue
+        handlers[variable] = value
+    if not handlers:
+        return
+    proxy = request.ProxyHandler(handlers)
+    request.install_opener(request.build_opener(proxy))
+
+
 if __name__ == '__main__':
     # resp = request.urlopen('https://news.ycombinator.com/rss')
     # source = resp.read().decode('utf-8')
@@ -173,8 +184,10 @@ if __name__ == '__main__':
     # parser.feed(source)
     # min_pubdate = min(i['pubdate'] for i in parser.items)
 
-    with connect(cfg):
-        create_tables()
+    # enable_proxy()
+
+    # with connect(cfg):
+    #     create_tables()
 
         # # Collect linked pages content
         # in_db = set(l for l, in View('feed_item', ['link']).read())
@@ -206,5 +219,5 @@ if __name__ == '__main__':
         #             continue
         #         print('\n\t' + '\n\t'.join(wrap(line)))
 
-        text = TextParser.get_text('https://news.ycombinator.com/item?id=17093538')
-        print(text)
+    text = TextParser.get_text('https://stackoverflow.com/questions/21619468/curl-returns-unknown-protocol')
+    print(text)
