@@ -1,17 +1,21 @@
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from html.parser import HTMLParser
-from urllib import request
+from urllib.request import (urlopen, Request, ProxyHandler, install_opener,
+                            build_opener)
+import dateutil
+import gzip
+import io
+import textwrap
 import urllib
 
 from tanker import connect, View, yaml_load, create_tables
-import dateutil
 
 # Add proxy support
-proxy = request.ProxyHandler({
+proxy = ProxyHandler({
     'http': 'http://proxy.eib.electrabel.be:8080',
     'https': 'http://proxy.eib.electrabel.be:8080',
 })
-request.install_opener(request.build_opener(proxy))
+install_opener(build_opener(proxy))
 
 schema = '''
 - table: feed
@@ -27,16 +31,34 @@ schema = '''
     pubdate: timestamp
     title: varchar
     description: varchar
+    text: varchar
     extra: jsonb
   key:
     - link
 '''
 
 cfg = {
-    'db_uri': 'postgresql:///test',
+    # 'db_uri': 'postgresql:///test',
+    'db_uri': 'sqlite:///test.db',
     'schema': yaml_load(schema),
 }
 
+
+def get(url):
+    ua = 'curl 7.16.1 (i386-portbld-freebsd6.2) libcurl/7.16.1 OpenSSL/0.9.7m zlib/1.2.3'
+    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
+    resp = urlopen(Request(url, headers={
+        'User-Agent': ua,
+        'Accept-encoding': 'gzip',
+    }))
+
+    if resp.headers.get('Content-Encoding') == 'gzip':
+        buf = io.BytesIO(resp.read())
+        f = gzip.GzipFile(fileobj=buf)
+        content = f.read()
+    else:
+        content = resp.read()
+    return content.decode('utf-8'), resp
 
 class Element:
     '''
@@ -73,12 +95,12 @@ class TextParser(HTMLParser):
         self.stack.append(Element(tag, attrs))
 
     def handle_endtag(self, tag):
-        TODO pop stak until `tag` is encountered
-        self.record()
-        self.stack.pop()
-        print(key)
-        print(tag)
-        assert tag == leaf.name
+        leaf = self.stack and self.stack[-1]
+        while self.stack:
+            self.record()
+            self.stack.pop()
+            if tag == leaf.name:
+                break
 
     def handle_data(self, content):
         content = content.strip()
@@ -104,17 +126,16 @@ class TextParser(HTMLParser):
     @classmethod
     def get_text(cls, link):
         try:
-            resp = request.urlopen(link)
-        except urllib.error.HTTPError:
+            content, resp = get(link)
+        except (urllib.error.HTTPError, urllib.error.URLError):
             return None
         content_type = resp.headers.get('Content-Type')
         if not content_type.startswith('text/html'):
             return None
 
-        source = resp.read().decode('utf-8')
         tp = TextParser()
-        tp.feed(source)
-        return '\n'.join(tp.topN(3))
+        tp.feed(content)
+        return '\n'.join(textwrap.fill(l) for l in tp.topN(3))
 
 
 class RSSParser(HTMLParser):
@@ -133,6 +154,7 @@ class RSSParser(HTMLParser):
     def inspect(self):
         prefix = tuple(i.name for i in self.stack[:-1])
         leaf = self.stack[-1]
+
         if prefix == ('rss', 'channel'):
             if leaf.name == 'item':
                 self.items.append(self.item_info)
@@ -173,12 +195,14 @@ class RSSParser(HTMLParser):
         leaf.content += content
 
 if __name__ == '__main__':
-    resp = request.urlopen('https://news.ycombinator.com/rss')
-    source = resp.read().decode('utf-8')
-    parser = RSSParser()
-    parser.feed(source)
+    # url = 'http://firstround.com/review/hypergrowth-and-the-law-of-startup-physics'
+    # content, resp = get(url)
+    # import pdb;pdb.set_trace()
+    # print(content)
 
-    import pdb;pdb.set_trace()
+    parser = RSSParser()
+    content, resp = get('https://news.ycombinator.com/rss')
+    parser.feed(content)
     with connect(cfg):
         create_tables()
         View('feed_item', {
@@ -186,6 +210,13 @@ if __name__ == '__main__':
             'link': 'link',
             'pubdate': 'pubdate',
             'description': 'description',
+            'text': 'text',
             'extra': 'extra',
             # TODO add feed.link
         }).write(parser.items)
+
+    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
+    # parser = TextParser()
+    # parser.feed(source)
+    # import pdb;pdb.set_trace()
+    # print('done')
