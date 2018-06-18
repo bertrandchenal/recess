@@ -3,6 +3,7 @@ from html.parser import HTMLParser
 from urllib.request import (urlopen, Request, ProxyHandler, install_opener,
                             build_opener)
 import dateutil
+import os
 import gzip
 import io
 import textwrap
@@ -10,12 +11,6 @@ import urllib
 
 from tanker import connect, View, yaml_load, create_tables
 
-# Add proxy support
-proxy = ProxyHandler({
-    'http': 'http://proxy.eib.electrabel.be:8080',
-    'https': 'http://proxy.eib.electrabel.be:8080',
-})
-install_opener(build_opener(proxy))
 
 schema = '''
 - table: feed
@@ -86,13 +81,11 @@ class TextParser(HTMLParser):
                          'form', 'html', 'body', 'path', 'style'])
         super().__init__()
 
-    def record(self):
-        el = self.stack[-1]
-        key = tuple(i.name for i in self.stack)
-        self.rows.append((key, el.content))
-
     def handle_starttag(self, tag, attrs):
-        self.stack.append(Element(tag, attrs))
+        el = Element(tag, attrs)
+        self.stack.append(el)
+        key = tuple(i.name for i in self.stack)
+        self.rows.append((key, el))
 
     def handle_endtag(self, tag):
         leaf = self.stack and self.stack[-1]
@@ -115,13 +108,13 @@ class TextParser(HTMLParser):
 
     def topN(self, n=3):
         scores = defaultdict(list)
-        for k, content in self.rows:
-            scores[k].append(len(content))
+        for k, el in self.rows:
+            scores[k].append(len(el.content))
         board = [(sum(s)/len(s), k) for k, s in scores.items()]
         keep = set(k for s, k in  sorted(board)[-n:])
-        for k, content in self.rows:
+        for k, el in self.rows:
             if k in keep:
-                yield content
+                yield el.content
 
     @classmethod
     def get_text(cls, link):
@@ -166,13 +159,6 @@ class RSSParser(HTMLParser):
             if leaf.name in ('title', 'link', 'pubdate', 'description'):
                 if leaf.name == 'pubdate':
                     leaf.content = dateutil.parser.parse(leaf.content)
-                elif leaf.name == 'link':
-                    link = leaf.content
-                    print('\n ----\n')
-                    print(link)
-                    text = TextParser.get_text(link)
-                    print(text and text[:100])
-                    self.item_info['text'] = text
                 self.item_info[leaf.name] = leaf.content
             else:
                 extra = self.item_info.setdefault('extra', {})
@@ -194,7 +180,23 @@ class RSSParser(HTMLParser):
         leaf = self.stack[-1]
         leaf.content += content
 
+
+def auto_proxy():
+    # Add proxy support
+    handlers = {}
+    for variable in ('http_proxy', 'https_proxy'):
+        value = os.environ.get('http_proxy')
+        if not value:
+            continue
+        handlers[variable] = value
+    if not handlers:
+        return
+    proxy = ProxyHandler(handlers)
+    install_opener(build_opener(proxy))
+
+
 if __name__ == '__main__':
+    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
     # url = 'http://firstround.com/review/hypergrowth-and-the-law-of-startup-physics'
     # content, resp = get(url)
     # import pdb;pdb.set_trace()
@@ -203,8 +205,22 @@ if __name__ == '__main__':
     parser = RSSParser()
     content, resp = get('https://news.ycombinator.com/rss')
     parser.feed(content)
+    auto_proxy()
+
     with connect(cfg):
         create_tables()
+
+        # Collect linked pages content
+        in_db = set(l for l, in View('feed_item', ['link']).read())
+        for item in parser.items:
+            link = item['link']
+            if link in in_db:
+                continue
+            else:
+                print('Load %s' % link)
+                text = TextParser.get_text(link)
+                item['text'] = text
+        # Update db
         View('feed_item', {
             'title': 'title',
             'link': 'link',
@@ -214,9 +230,3 @@ if __name__ == '__main__':
             'extra': 'extra',
             # TODO add feed.link
         }).write(parser.items)
-
-    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
-    # parser = TextParser()
-    # parser.feed(source)
-    # import pdb;pdb.set_trace()
-    # print('done')
