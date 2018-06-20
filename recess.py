@@ -6,10 +6,16 @@ import dateutil
 import os
 import gzip
 import io
+import logging
 import textwrap
 import urllib
 
 from tanker import connect, View, yaml_load, create_tables
+
+fmt = '%(levelname)s:%(asctime).19s: %(message)s'
+logging.basicConfig(format=fmt)
+logger = logging.getLogger('recess')
+logger.setLevel('WARN')
 
 
 schema = '''
@@ -55,6 +61,7 @@ def get(url):
         content = resp.read()
     return content.decode('utf-8'), resp
 
+
 class Element:
     '''
     Utility class for TextParser
@@ -84,13 +91,10 @@ class TextParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         el = Element(tag, attrs)
         self.stack.append(el)
-        key = tuple(i.name for i in self.stack)
-        self.rows.append((key, el))
 
     def handle_endtag(self, tag):
         leaf = self.stack and self.stack[-1]
         while self.stack:
-            self.record()
             self.stack.pop()
             if tag == leaf.name:
                 break
@@ -101,34 +105,37 @@ class TextParser(HTMLParser):
             return
         if not self.stack:
             return
-        leaf = self.stack[-1]
-        if leaf.name in self.skip:
+        key = tuple(i.name for i in self.stack)
+        if key[-1] in self.skip:
             return
-        leaf.content += content
+        self.rows.append((key, content))
 
     def topN(self, n=3):
         scores = defaultdict(list)
-        for k, el in self.rows:
-            scores[k].append(len(el.content))
+        for k, content in self.rows:
+            scores[k].append(len(content))
         board = [(sum(s)/len(s), k) for k, s in scores.items()]
         keep = set(k for s, k in  sorted(board)[-n:])
-        for k, el in self.rows:
-            if k in keep:
-                yield el.content
+        match = lambda n: any(x[:len(n)] == n for x in keep)
+        for k, content in self.rows:
+            if match(k):
+                yield content
 
     @classmethod
     def get_text(cls, link):
         try:
             content, resp = get(link)
-        except (urllib.error.HTTPError, urllib.error.URLError):
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            logger.info('Unable to load %s' % link)
             return None
         content_type = resp.headers.get('Content-Type')
         if not content_type.startswith('text/html'):
+            logger.info('Unable to parse %s' % link)
             return None
 
         tp = TextParser()
         tp.feed(content)
-        return '\n'.join(textwrap.fill(l) for l in tp.topN(3))
+        return '\n'.join(textwrap.fill(l) for l in tp.topN())
 
 
 class RSSParser(HTMLParser):
@@ -195,17 +202,12 @@ def auto_proxy():
     install_opener(build_opener(proxy))
 
 
-if __name__ == '__main__':
-    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
-    # url = 'http://firstround.com/review/hypergrowth-and-the-law-of-startup-physics'
-    # content, resp = get(url)
-    # import pdb;pdb.set_trace()
-    # print(content)
+def refresh():
 
     parser = RSSParser()
     content, resp = get('https://news.ycombinator.com/rss')
     parser.feed(content)
-    auto_proxy()
+    # auto_proxy()
 
     with connect(cfg):
         create_tables()
@@ -217,7 +219,7 @@ if __name__ == '__main__':
             if link in in_db:
                 continue
             else:
-                print('Load %s' % link)
+                logger.info('Load %s' % link)
                 text = TextParser.get_text(link)
                 item['text'] = text
         # Update db
@@ -230,3 +232,56 @@ if __name__ == '__main__':
             'extra': 'extra',
             # TODO add feed.link
         }).write(parser.items)
+
+
+def list_items(args):
+    with connect(cfg):
+        view = View('feed_item', ['title'])
+        res = view.read(order=('pubdate', 'desc'), limit=args.limit)
+        for pos, (title,) in enumerate(res):
+            print('%s | %s' % (pos, title))
+
+def read_item(args):
+    if len(args.action) > 1:
+        offset = args.action[1]
+    else:
+        offset = 0
+
+    with connect(cfg):
+        view = View('feed_item', ['title', 'text'])
+        res = view.read(order=('pubdate', 'desc'), limit=1, offset=offset)
+        title, text = res.one()
+        print(title)
+        print('-' * len(title))
+        print(text)
+
+if __name__ == '__main__':
+    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
+    # url = 'http://firstround.com/review/hypergrowth-and-the-law-of-startup-physics'
+    # content, resp = get(url)
+    # print(content)
+
+    import argparse
+    parser = argparse.ArgumentParser(description='ReceSS')
+    parser.add_argument('action', help='info, read, refresh', nargs='+')
+    parser.add_argument('-v', '--verbose', action='count',
+                        help='Increase verbosity')
+    parser.add_argument('-l', '--limit', type=int, default=10,
+                        help='Number of results')
+
+    args = parser.parse_args()
+    if args.verbose:
+        logger.setLevel('DEBUG' if args.verbose > 1 else 'INFO')
+        if args.verbose > 2:
+            from tanker import logger as tanker_logger
+            tanker_logger.setLevel('DEBUG')
+
+    action = args.action[0]
+    if action == 'refresh':
+        refresh()
+    elif action == 'list':
+        list_items(args)
+    elif action == 'read':
+        read_item(args)
+    else:
+        exit('Action "%s" not supported' % action)
