@@ -1,5 +1,6 @@
 from collections import defaultdict
 from html.parser import HTMLParser
+from itertools import groupby
 from urllib.request import (urlopen, Request, ProxyHandler, install_opener,
                             build_opener)
 import dateutil
@@ -59,7 +60,53 @@ def get(url):
         content = f.read()
     else:
         content = resp.read()
-    return content.decode('utf-8'), resp
+    encoding = None
+    content_type = resp.getheader('Content-Type', '')
+    token = 'charset='
+    if token in content_type:
+        encoding = content_type.rsplit(token)[1]
+    return content.decode(encoding or 'utf-8', errors='replace'), resp
+
+
+# class Matcher:
+#     def __init__(self, words):
+#         self.candidates = Matcher.gen_candidates(words)
+#         return candidates
+#     def ok(self,  word):
+#         for ed in Matcher.edits(word):
+#             if ed in self.candidates:
+#                 return True
+#         return False
+
+    # @staticmethod
+    # def edits(word):
+    #     yield word
+    #     splits = ((word[:i], word[i:]) for i in range(len(word) + 1))
+    #     for left, right in splits:
+    #         if right:
+    #             yield left + right[1:]
+
+    # @staticmethod
+    # def gen_candidates(wordlist):
+    #     for word in wordlist:
+    #         for ed1 in Matcher.edits(word):
+    #             yield ed1
+
+class Matcher:
+    def __init__(self, keys):
+        self.keys = set(keys)
+
+    def ok(self, key):
+        for candidate in self.keys:
+            prefix = key[:len(candidate)]
+            if prefix == candidate:
+                return True
+        return False
+
+
+def collapse(items):
+    for x, _ in groupby(items):
+        yield x
 
 
 class Element:
@@ -93,6 +140,9 @@ class TextParser(HTMLParser):
         self.stack.append(el)
 
     def handle_endtag(self, tag):
+        # We could in theory simply call pop, but some pages do not
+        # like to close all their tags, so keep popping until we find
+        # the correct tag
         leaf = self.stack and self.stack[-1]
         while self.stack:
             self.stack.pop()
@@ -106,26 +156,40 @@ class TextParser(HTMLParser):
         if not self.stack:
             return
         key = tuple(i.name for i in self.stack)
-        if key[-1] in self.skip:
+        leaf = self.stack[-1]
+        if leaf.name in self.skip:
             return
+        # if leaf.name == 'a':
+        #     href = leaf.attrs.get('href')
+        #     if href and href.strip() != content.strip():
+        #         content = f'[{content}]({href})'
+        # elif leaf.name == 'p':
+        #     content = '\n\n' + content
+        key = tuple(collapse(key))
         self.rows.append((key, content))
 
-    def topN(self, n=3):
+    def topN(self, n=4):
         scores = defaultdict(list)
         for k, content in self.rows:
             scores[k].append(len(content))
         board = [(sum(s)/len(s), k) for k, s in scores.items()]
         keep = set(k for s, k in  sorted(board)[-n:])
-        match = lambda n: any(x[:len(n)] == n for x in keep)
+        matcher = Matcher(keep)
+        prev = False
         for k, content in self.rows:
-            if match(k):
+            if matcher.ok(k):
+                prev = True
                 yield content
+            elif prev:
+                print('->', content)
+                yield content
+                prev = False
 
     @classmethod
     def get_text(cls, link):
         try:
             content, resp = get(link)
-        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        except (urllib.error.HTTPError, urllib.error.URLError):
             logger.info('Unable to load %s' % link)
             return None
         content_type = resp.headers.get('Content-Type')
@@ -202,10 +266,10 @@ def auto_proxy():
     install_opener(build_opener(proxy))
 
 
-def refresh():
+def refresh(start_url):
 
     parser = RSSParser()
-    content, resp = get('https://news.ycombinator.com/rss')
+    content, resp = get(start_url)
     parser.feed(content)
     # auto_proxy()
 
@@ -242,32 +306,46 @@ def list_items(args):
             print('%s | %s' % (pos, title))
 
 def read_item(args):
+    offset = None
     if len(args.action) > 1:
-        offset = args.action[1]
+        what  = args.action[1]
+        try:
+            offset = int(what)
+        except ValueError:
+            pass
     else:
         offset = 0
 
-    with connect(cfg):
-        view = View('feed_item', ['title', 'text'])
-        res = view.read(order=('pubdate', 'desc'), limit=1, offset=offset)
-        title, text = res.one()
+    if offset is not None:
+        # Read given position in db
+        with connect(cfg):
+            view = View('feed_item', ['title', 'text', 'link'])
+            res = view.read(order=('pubdate', 'desc'), limit=1, offset=offset)
+            title, text, link = res.one()
+    else:
+        # Try to read given url
+        text = TextParser.get_text(what)
+        title = what
+    # Print content
+    try:
         print(title)
         print('-' * len(title))
         print(text)
+        print(link)
+    except :
+        pass
 
 if __name__ == '__main__':
-    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
-    # url = 'http://firstround.com/review/hypergrowth-and-the-law-of-startup-physics'
-    # content, resp = get(url)
-    # print(content)
-
     import argparse
     parser = argparse.ArgumentParser(description='ReceSS')
-    parser.add_argument('action', help='info, read, refresh', nargs='+')
+    parser.add_argument('action', help='list, read, refresh', nargs='+')
     parser.add_argument('-v', '--verbose', action='count',
                         help='Increase verbosity')
     parser.add_argument('-l', '--limit', type=int, default=10,
                         help='Number of results')
+    parser.add_argument('-s', '--start-url',
+                        default='https://news.ycombinator.com/rss',
+                        help='Starting page')
 
     args = parser.parse_args()
     if args.verbose:
@@ -278,7 +356,7 @@ if __name__ == '__main__':
 
     action = args.action[0]
     if action == 'refresh':
-        refresh()
+        refresh(args.start_url)
     elif action == 'list':
         list_items(args)
     elif action == 'read':
