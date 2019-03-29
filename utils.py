@@ -108,7 +108,7 @@ class LogMap:
         return self.log.tell() + self._cache_size
 
     def __contains__(self, key):
-        if key in self._write_cache:
+        if key in self._log_cache:
             return True
         return key in self.fst
 
@@ -122,8 +122,7 @@ class LogMap:
         tmp_path = f'{self.fst_path}-tmp'
         with Map.build(tmp_path) as tmp_map:
             for k, vals in self.fst.union(new_fst):
-                print(vals) # TODO check vals is in natural order
-                tmp_map.insert(k, vals[-1].value)
+                tmp_map.insert(k, max(v.value for v in vals))
         # Rename tmp file
         os.rename(tmp_path, self.fst_path)
 
