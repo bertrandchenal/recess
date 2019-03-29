@@ -1,339 +1,133 @@
-from collections import defaultdict
-from html.parser import HTMLParser
-from itertools import groupby
-from urllib.request import (urlopen, Request, ProxyHandler, install_opener,
-                            build_opener)
-import dateutil
+from itertools import chain
+import math
 import os
-import gzip
-import io
-import logging
-import textwrap
-import urllib
 
-from tanker import connect, View, yaml_load, create_tables
-
-fmt = '%(levelname)s:%(asctime).19s: %(message)s'
-logging.basicConfig(format=fmt)
-logger = logging.getLogger('recess')
-logger.setLevel('WARN')
+from rust_fst import Map
+from utils import get, TextParser, RSSParser, logger, normalize
 
 
-schema = '''
-- table: feed
-  columns:
-    link: varchar
-    title: varchar
-    description: varchar
-  key:
-    - link
-- table: feed_item
-  columns:
-    link: varchar
-    pubdate: timestamp
-    title: varchar
-    description: varchar
-    text: varchar
-    extra: jsonb
-  key:
-    - link
-'''
+class DB:
 
-cfg = {
-    # 'db_uri': 'postgresql:///test',
-    'db_uri': 'sqlite:///test.db',
-    'schema': yaml_load(schema),
-}
+    def __init__(self, path):
+        self.link_fst = os.path.join(path, 'link.fst')
+        self.link_tmp_fst = self.link_fst + '-tmp'
+        self.word_fst = os.path.join(path, 'word.fst')
+        self.word_tmp_fst = self.word_fst + '-tmp'
+        self.doc_log = os.path.join(path, 'docs.log')
+        self.doc_idx = os.path.join(path, 'docs.idx')
 
+    def append_document(self, content):
+        # Append content to log
+        with open(self.doc_log, 'a') as fh:
+            doc_pos = fh.tell()
+            fh.write(content)
+        # Append position of new content in idx file
+        with open(self.doc_idx, 'ab') as fh:
+            idx_pos = fh.tell()
+            fh.write(doc_pos.to_bytes(8, 'big'))
+        # Return document position
+        return idx_pos // 8
 
-def get(url):
-    ua = 'curl 7.16.1 (i386-portbld-freebsd6.2) libcurl/7.16.1 OpenSSL/0.9.7m zlib/1.2.3'
-    # url = 'https://medium.com/@iantien/top-takeaways-from-andy-grove-s-high-output-management-2e0ecfb1ea63'
-    resp = urlopen(Request(url, headers={
-        'User-Agent': ua,
-        'Accept-encoding': 'gzip',
-    }))
+    def get_link_map(self):
+        if os.path.exists(self.link_fst):
+            return Map(self.link_fst)
+        return Map.from_iter([])
 
-    if resp.headers.get('Content-Encoding') == 'gzip':
-        buf = io.BytesIO(resp.read())
-        f = gzip.GzipFile(fileobj=buf)
-        content = f.read()
-    else:
-        content = resp.read()
-    encoding = None
-    content_type = resp.getheader('Content-Type', '')
-    token = 'charset='
-    if token in content_type:
-        encoding = content_type.rsplit(token)[1]
-    return content.decode(encoding or 'utf-8', errors='replace'), resp
+    def get_word_map(self):
+        if os.path.exists(self.word_fst):
+            return Map(self.word_fst)
+        return Map.from_iter([])
 
+    def update_word_fst(self, fragments, doc_id):
+        # Transform doc_id into bitset
+        print(doc_id)
+        doc_id = 1 << doc_id # TODO add a new log containing the bitset!
+        word_fst = self.get_word_map()
+        words = list(chain.from_iterable((f.split() for f in fragments)))
+        words = (normalize(m).lower() for m in set(words))
+        words = set(w for w in words if len(w) > 1)
+        doc_fst = Map.from_iter((w, doc_id) for w in sorted(words))
 
-# class Matcher:
-#     def __init__(self, words):
-#         self.candidates = Matcher.gen_candidates(words)
-#         return candidates
-#     def ok(self,  word):
-#         for ed in Matcher.edits(word):
-#             if ed in self.candidates:
-#                 return True
-#         return False
+        # Save union in tmp file
+        with Map.build(self.word_tmp_fst) as tmp_map:
+            for k, vals in word_fst.union(doc_fst):
+                if len(vals) == 1:
+                    v = vals[0].value
+                elif len(vals) == 2:
+                    v = vals[0].value | vals[0].value
+                else:
+                    raise ValueError('Unexpected!')
+                tmp_map.insert(k, v)
 
-    # @staticmethod
-    # def edits(word):
-    #     yield word
-    #     splits = ((word[:i], word[i:]) for i in range(len(word) + 1))
-    #     for left, right in splits:
-    #         if right:
-    #             yield left + right[1:]
+        # Rename tmp file
+        os.rename(self.word_tmp_fst, self.word_fst)
 
-    # @staticmethod
-    # def gen_candidates(wordlist):
-    #     for word in wordlist:
-    #         for ed1 in Matcher.edits(word):
-    #             yield ed1
+    def append_link(self, link, doc_id):
+        new_fst = Map.from_iter([(link, doc_id)])
+        link_fst = self.get_link_map()
 
-class Matcher:
-    def __init__(self, keys):
-        self.keys = set(keys)
+        # Save union in tmp file
+        with Map.build(self.link_tmp_fst) as tmp_map:
+            for k, vals in link_fst.union(new_fst):
+                tmp_map.insert(k, vals[0].value)
 
-    def ok(self, key):
-        for candidate in self.keys:
-            prefix = key[:len(candidate)]
-            if prefix == candidate:
-                return True
-        return False
+        # Rename tmp file
+        os.rename(self.link_tmp_fst, self.link_fst)
 
-
-def collapse(items):
-    for x, _ in groupby(items):
-        yield x
-
-
-class Element:
-    '''
-    Utility class for TextParser
-    '''
-    def __init__(self, name, attrs):
-        self.name = name.lower()
-        self.attrs = dict(attrs)
-        self.content = ''
-
-    def __repr__(self):
-        return '<%s: %s (%s)>' % (self.name, self.content, self.attrs.items())
-
-
-class TextParser(HTMLParser):
-    '''
-    Extract meaningful text from a webpage by identifying elements
-    path with the longest average content.
-    '''
-
-    def __init__(self):
-        self.rows = []
-        self.stack = []
-        self.skip = set(['script', 'noscript', 'svg', 'img', 'g', 'input',
-                         'form', 'html', 'body', 'path', 'style'])
-        super().__init__()
-
-    def handle_starttag(self, tag, attrs):
-        el = Element(tag, attrs)
-        self.stack.append(el)
-
-    def handle_endtag(self, tag):
-        # We could in theory simply call pop, but some pages do not
-        # like to close all their tags, so keep popping until we find
-        # the correct tag
-        leaf = self.stack and self.stack[-1]
-        while self.stack:
-            self.stack.pop()
-            if tag == leaf.name:
-                break
-
-    def handle_data(self, content):
-        content = content.strip()
-        if not content:
+    def insert(self, link, fragments):
+        if link in self.get_link_map():
             return
-        if not self.stack:
-            return
-        key = tuple(i.name for i in self.stack)
-        leaf = self.stack[-1]
-        if leaf.name in self.skip:
-            return
-        # if leaf.name == 'a':
-        #     href = leaf.attrs.get('href')
-        #     if href and href.strip() != content.strip():
-        #         content = f'[{content}]({href})'
-        # elif leaf.name == 'p':
-        #     content = '\n\n' + content
-        key = tuple(collapse(key))
-        self.rows.append((key, content))
+        doc_id = self.append_document(''.join(fragments))
+        self.update_word_fst(fragments, doc_id)
+        self.append_link(link, doc_id)
 
-    def topN(self, n=4):
-        scores = defaultdict(list)
-        for k, content in self.rows:
-            scores[k].append(len(content))
-        board = [(sum(s)/len(s), k) for k, s in scores.items()]
-        keep = set(k for s, k in  sorted(board)[-n:])
-        matcher = Matcher(keep)
-        prev = False
-        for k, content in self.rows:
-            if matcher.ok(k):
-                prev = True
-                yield content
-            elif prev:
-                print('->', content)
-                yield content
-                prev = False
+    def complete(self, word):
+        m = self.get_word_map()
+        for value, _ in m.search(word, 2):
+            yield value
 
-    @classmethod
-    def get_text(cls, link):
-        try:
-            content, resp = get(link)
-        except (urllib.error.HTTPError, urllib.error.URLError):
-            logger.info('Unable to load %s' % link)
-            return None
-        content_type = resp.headers.get('Content-Type')
-        if not content_type.startswith('text/html'):
-            logger.info('Unable to parse %s' % link)
-            return None
+    def search(self, words):
+        m = self.get_word_map()
+        bitset = None
+        for word in words:
+            for _, doc_id in m.search(word, 0):
+                if bitset == 0:
+                    return
+                elif bitset is None:
+                    bitset = doc_id
+                else:
+                    bitset = doc_id & bitset
 
-        tp = TextParser()
-        tp.feed(content)
-        return '\n'.join(textwrap.fill(l) for l in tp.topN())
+        while bitset:
+            doc_id = int(math.log(bitset, 2))
+            yield f'FOUND {doc_id}'
+            bitset = bitset - (1 << doc_id)
 
 
-class RSSParser(HTMLParser):
-    '''
-    Parse RSS files
-    '''
-    # XXX we may need to use xml.sax to be able to extract cdata
+def crawl(db, start_url):
+    link_fst = db.get_link_map()
 
-    def __init__(self):
-        self.stack = []
-        self.channel_info = {}
-        self.items = []
-        self.item_info = {}
-        super().__init__()
-
-    def inspect(self):
-        prefix = tuple(i.name for i in self.stack[:-1])
-        leaf = self.stack[-1]
-
-        if prefix == ('rss', 'channel'):
-            if leaf.name == 'item':
-                self.items.append(self.item_info)
-                self.item_info['feed_link'] = self.channel_info['link']
-                self.item_info = {}
-            else:
-                self.channel_info[leaf.name] = leaf.content
-        elif prefix == ('rss', 'channel', 'item'):
-            if leaf.name in ('title', 'link', 'pubdate', 'description'):
-                if leaf.name == 'pubdate':
-                    leaf.content = dateutil.parser.parse(leaf.content)
-                self.item_info[leaf.name] = leaf.content
-            else:
-                extra = self.item_info.setdefault('extra', {})
-                extra[leaf.name] = leaf.content
-
-    def handle_starttag(self, tag, attrs):
-        self.stack.append(Element(tag, attrs))
-
-    def handle_endtag(self, tag):
-        self.inspect()
-        self.stack.pop()
-
-    def handle_data(self, content):
-        content = content.strip()
-        if not content:
-            return
-        if not self.stack:
-            return
-        leaf = self.stack[-1]
-        leaf.content += content
-
-
-def auto_proxy():
-    # Add proxy support
-    handlers = {}
-    for variable in ('http_proxy', 'https_proxy'):
-        value = os.environ.get('http_proxy')
-        if not value:
-            continue
-        handlers[variable] = value
-    if not handlers:
-        return
-    proxy = ProxyHandler(handlers)
-    install_opener(build_opener(proxy))
-
-
-def refresh(start_url):
-
-    parser = RSSParser()
     content, resp = get(start_url)
-    parser.feed(content)
-    # auto_proxy()
+    content_type = resp.headers.get('Content-Type').split(';', 1)[0]
+    if content_type == 'application/rss+xml':
+        parser = RSSParser()
+        parser.feed(content)
+    else:
+        logger.error(f'Content type {content_type} not supported for crawl')
+        return
 
-    with connect(cfg):
-        create_tables()
-
-        # Collect linked pages content
-        in_db = set(l for l, in View('feed_item', ['link']).read())
-        for item in parser.items:
-            link = item['link']
-            if link in in_db:
+    # Collect linked pages content
+    for item in parser.items:
+        for link in (item['link'], item['extra']['comments']):
+            logger.info(f'CRAWL {link}' )
+            if link in link_fst:
                 continue
             else:
                 logger.info('Load %s' % link)
-                text = TextParser.get_text(link)
-                item['text'] = text
-        # Update db
-        View('feed_item', {
-            'title': 'title',
-            'link': 'link',
-            'pubdate': 'pubdate',
-            'description': 'description',
-            'text': 'text',
-            'extra': 'extra',
-            # TODO add feed.link
-        }).write(parser.items)
-
-
-def list_items(args):
-    with connect(cfg):
-        view = View('feed_item', ['title'])
-        res = view.read(order=('pubdate', 'desc'), limit=args.limit)
-        for pos, (title,) in enumerate(res):
-            print('%s | %s' % (pos, title))
-
-def read_item(args):
-    offset = None
-    if len(args.action) > 1:
-        what  = args.action[1]
-        try:
-            offset = int(what)
-        except ValueError:
-            pass
-    else:
-        offset = 0
-
-    if offset is not None:
-        # Read given position in db
-        with connect(cfg):
-            view = View('feed_item', ['title', 'text', 'link'])
-            res = view.read(order=('pubdate', 'desc'), limit=1, offset=offset)
-            title, text, link = res.one()
-    else:
-        # Try to read given url
-        text = TextParser.get_text(what)
-        title = what
-    # Print content
-    try:
-        print(title)
-        print('-' * len(title))
-        print(text)
-        print(link)
-    except :
-        pass
+                fragments = TextParser.get_text(link)
+                if fragments is None:
+                    continue
+                db.insert(link, list(fragments))
 
 if __name__ == '__main__':
     import argparse
@@ -343,7 +137,7 @@ if __name__ == '__main__':
                         help='Increase verbosity')
     parser.add_argument('-l', '--limit', type=int, default=10,
                         help='Number of results')
-    parser.add_argument('-s', '--start-url',
+    parser.add_argument('-u', '--url',
                         default='https://news.ycombinator.com/rss',
                         help='Starting page')
 
@@ -354,12 +148,21 @@ if __name__ == '__main__':
             from tanker import logger as tanker_logger
             tanker_logger.setLevel('DEBUG')
 
-    action = args.action[0]
-    if action == 'refresh':
-        refresh(args.start_url)
-    elif action == 'list':
-        list_items(args)
-    elif action == 'read':
-        read_item(args)
+
+    db = DB('db')
+    action, *extra = args.action
+    if action == 'complete':
+        for item in extra:
+            for suggestion in db.complete(item):
+                print(item, suggestion)
+    elif action == 'search':
+        for doc in db.search(extra):
+            print(doc)
+    elif action == 'crawl':
+        crawl(db, args.url)
+    elif action == 'insert':
+        fragments = TextParser.get_text(args.url)
+        frag = list(fragments)
+        db.insert(args.url, list(fragments))
     else:
         exit('Action "%s" not supported' % action)
