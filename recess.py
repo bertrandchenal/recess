@@ -1,7 +1,9 @@
 #! /usr/bin/env python
+
 from hashlib import md5
 from itertools import chain
 import os
+import textwrap
 
 from pyroaring import BitMap
 
@@ -29,6 +31,7 @@ class DB:
         words = set(w for w in words if len(w) > 1)
         for w in sorted(words):
             pageset_id = self.word.get(w)
+            print(w, pageset_id)
             new_ps_id = self.update_pageset(doc_id, pageset_id)
             self.word[w] = new_ps_id
 
@@ -37,22 +40,26 @@ class DB:
             bm = BitMap()
         else:
             # pageset contains content-addressed bitmaps
-            bm = BitMap.deserialize(self.pageset.read_at(pageset_id))
+            # TODO will fail on non-yet-flushed data
+            bm_bytes = self.pageset.read_at(pageset_id)
+            bm = BitMap.deserialize(bm_bytes)
         bm.add(doc_id)
-        bm_s = bm.serialize()
-        new_checksum = md5(bm_s).hexdigest()
-        self.pageset[new_checksum] = bm_s
+        bm_bytes = bm.serialize()
+        new_checksum = md5(bm_bytes).hexdigest()
+        self.pageset[new_checksum] = bm_bytes # IDEA prefix payload with checksum
         return len(self.pageset) - 1
 
     def insert(self, link, fragments):
         if link in self.link:
             return
-        payload = ''.join(fragments).encode()
+        link = link.strip()
+        payload = link.encode() + b'\n' + ''.join(fragments).encode()
         key = md5(payload).hexdigest()
         self.page[key] = payload
         page_idx = len(self.page) - 1
         self.link[link] = page_idx
         self.update_word_index(fragments, page_idx)
+        self.flush()
 
     def flush(self):
         self.pageset.flush()
@@ -68,12 +75,19 @@ class DB:
         for word in words:
             for _, ps_id in self.word.search(word, 0):
                 bm = self.pageset.read_at(ps_id)
-                print(list(BitMap.deserialize(bm)))
-                yield 'todo'
+                for offset in BitMap.deserialize(bm):
+                    # yield self.page.read_at(offset, 1).decode()
+                    content = self.page.read_at(offset)[:500].decode()
+                    url, text = content.split('\n', 1)
+                    yield '\n' +url
+                    yield textwrap.fill(text)
+    def compact(self):
+        # TODO loop on all values of self.link and self.word and
+        # re-generate a fresh self.pageset
+        pass
+
 
 def crawl(db, start_url):
-    link_fst = db.get_link_map()
-
     content, resp = get(start_url)
     content_type = resp.headers.get('Content-Type').split(';', 1)[0]
     if content_type == 'application/rss+xml':
@@ -87,7 +101,7 @@ def crawl(db, start_url):
     for item in parser.items:
         for link in (item['link'], item['extra']['comments']):
             logger.info(f'CRAWL {link}' )
-            if link in link_fst:
+            if link in db.link:
                 continue
             else:
                 logger.info('Load %s' % link)
@@ -95,6 +109,7 @@ def crawl(db, start_url):
                 if fragments is None:
                     continue
                 db.insert(link, list(fragments))
+
 
 if __name__ == '__main__':
     import argparse
@@ -126,6 +141,5 @@ if __name__ == '__main__':
     elif action == 'insert':
         fragments = TextParser.get_text(args.url)
         db.insert(args.url, list(fragments))
-        db.flush()
     else:
         exit('Action "%s" not supported' % action)

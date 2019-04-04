@@ -110,6 +110,10 @@ class CachedMap:
         # Rename tmp file
         os.rename(tmp_path, self._path)
 
+        # Desallocate
+        self._cache = {}
+        self._fst = None
+
 
 class LogMap:
     '''
@@ -170,17 +174,20 @@ class LogMap:
         offset = self.fst[key]
         return self.read_at(offset)
 
-    def read_at(self, offset):
+    def read_at(self, offset, nb_line=0):
         self.idx.seek(offset * 8)
         idx_row = self.idx.read(8)
         log_pos = int.from_bytes(idx_row[:4], 'big', signed=False)
         length = int.from_bytes(idx_row[4:], 'big', signed=False)
         self.log.seek(log_pos)
-        value = self.log.read(length)
+        if nb_line:
+            value = b'\n'.join(next(self.log).strip() for _ in range(nb_line))
+        else:
+            value = self.log.read(length)
 
         # Seek back to end
-        self._idx.seek(0, os.SEEK_END)
-        self._log.seek(0, os.SEEK_END)
+        self.idx.seek(0, os.SEEK_END)
+        self.log.seek(0, os.SEEK_END)
         return value
 
     def tell(self):
@@ -218,6 +225,13 @@ class LogMap:
         # Close file descriptors
         self.log.close()
         self.idx.close()
+        # Desallocate
+        self._idx = None
+        self._fst = None
+        self._log = None
+        self._cache_size = 0
+        self._log_cache = OrderedDict()
+        self._fst_cache = {}
 
 class Matcher:
     def __init__(self, keys):
