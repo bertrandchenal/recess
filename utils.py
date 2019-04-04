@@ -56,24 +56,83 @@ def get(url):
 #         with open(self._path(key), 'w') as fh:
 #             fh.read()
 
+
+class CachedMap:
+
+    def __init__(self, path):
+        self._path = path
+        self._cache = {} # TODO rename into _write_cache
+        self._fst = None
+
+    @property
+    def fst(self):
+        if self._fst is None:
+            if os.path.exists(self._path):
+                self._fst = Map(self._path)
+            else:
+                self._fst = Map.from_iter([])
+        return self._fst
+
+    def __setitem__(self, key, value):
+        assert isinstance(value, int)
+        self._cache[key] = value
+
+    def __getitem__(self, key):
+        try:
+            return self._cache[key]
+        except KeyError:
+            pass
+        _, value = next(self.fst.search(key, max_dist=0), (None, None))
+        if value is None:
+            raise KeyError(f"Key '{key}' not in CachedMap")
+        return value
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        if key in self._cache:
+            return True
+        return key in self.fst
+
+    def search(self, key, max_dist=0):
+        return self.fst.search(key, max_dist=max_dist)
+
+    def flush(self):
+        tmp_path = f'{self._path}-tmp'
+        new_fst = Map.from_iter(sorted(self._cache.items()))
+        with Map.build(tmp_path) as tmp_map:
+            for k, vals in self.fst.union(new_fst):
+                tmp_map.insert(k, max(v.value for v in vals))
+        # Rename tmp file
+        os.rename(tmp_path, self._path)
+
+
 class LogMap:
     '''
     LogMap is based on n append-only log file and an fst Map that
     indexes the log file content.
     '''
-    def __init__(self, root):
+    def __init__(self, root, compress=False):
+        # TODO implement compression
+        os.makedirs(root, exist_ok=True)
         self.fst_path = os.path.join(root, 'fst')
         self.log_path = os.path.join(root, 'log')
+        self.idx_path = os.path.join(root, 'idx')
+        self._idx = None
         self._fst = None
         self._log = None
         self._cache_size = 0
         self._log_cache = OrderedDict()
-        self._fst_cache = OrderedDict()
+        self._fst_cache = {}
 
     @property
     def fst(self):
         if self._fst is None:
-            if os.path.exist(self.fst_path):
+            if os.path.exists(self.fst_path):
                 self._fst = Map(self.fst_path)
             else:
                 self._fst = Map.from_iter([])
@@ -82,8 +141,14 @@ class LogMap:
     @property
     def log(self):
         if self._log is None:
-            self._log = open(self.log_path, 'a')
+            self._log = open(self.log_path, 'ba+')
         return self._log
+
+    @property
+    def idx(self):
+        if self._idx is None:
+            self._idx = open(self.idx_path, 'ba+')
+        return self._idx
 
     def _get_fst_map(self):
         if os.path.exists(self.link_fst):
@@ -102,10 +167,27 @@ class LogMap:
             return self._log_cache[key]
         except KeyError:
             pass
-        return self.fst[key]
+        offset = self.fst[key]
+        return self.read_at(offset)
+
+    def read_at(self, offset):
+        self.idx.seek(offset * 8)
+        idx_row = self.idx.read(8)
+        log_pos = int.from_bytes(idx_row[:4], 'big', signed=False)
+        length = int.from_bytes(idx_row[4:], 'big', signed=False)
+        self.log.seek(log_pos)
+        value = self.log.read(length)
+
+        # Seek back to end
+        self._idx.seek(0, os.SEEK_END)
+        self._log.seek(0, os.SEEK_END)
+        return value
 
     def tell(self):
         return self.log.tell() + self._cache_size
+
+    def __len__(self):
+        return self.idx.tell() // 8 + len(self._log_cache)
 
     def __contains__(self, key):
         if key in self._log_cache:
@@ -115,10 +197,17 @@ class LogMap:
     def flush(self):
         # Write to log
         for value in self._log_cache.values():
+            # concat current log offset and value len in idx
+            offset = self.log.tell()
+            idx_row = offset.to_bytes(4, 'big', signed=False)
+            idx_row += len(value).to_bytes(4, 'big', signed=False)
+            self.idx.write(idx_row)
+            # Append payload
             self.log.write(value)
 
         # Update fst
-        new_fst = Map.from_iter(self._fst_cache.items())
+        # TODO use same dict to store the tuple (value, offset)
+        new_fst = Map.from_iter(sorted(self._fst_cache.items()))
         tmp_path = f'{self.fst_path}-tmp'
         with Map.build(tmp_path) as tmp_map:
             for k, vals in self.fst.union(new_fst):
@@ -126,6 +215,9 @@ class LogMap:
         # Rename tmp file
         os.rename(tmp_path, self.fst_path)
 
+        # Close file descriptors
+        self.log.close()
+        self.idx.close()
 
 class Matcher:
     def __init__(self, keys):
@@ -299,7 +391,7 @@ def auto_proxy():
     proxy = ProxyHandler(handlers)
     install_opener(build_opener(proxy))
 
-no_symbols_re = re.compile('[^a-zA-Z0-9]+')
+no_symbols_re = re.compile('[^a-zA-Z0-9\-]+')
 def normalize(data):
     norm = unicodedata.normalize('NFKD', data)
     return no_symbols_re.sub('', norm)
