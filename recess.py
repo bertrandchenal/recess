@@ -25,13 +25,11 @@ class DB:
 
     def update_word_index(self, fragments, doc_id):
         # Transform doc_id into bitset
-        print(doc_id)
         words = list(chain.from_iterable((f.split() for f in fragments)))
         words = (normalize(m).lower() for m in set(words))
         words = set(w for w in words if len(w) > 1)
         for w in sorted(words):
             pageset_id = self.word.get(w)
-            print(w, pageset_id)
             new_ps_id = self.update_pageset(doc_id, pageset_id)
             self.word[w] = new_ps_id
 
@@ -39,8 +37,6 @@ class DB:
         if pageset_id is None:
             bm = BitMap()
         else:
-            # pageset contains content-addressed bitmaps
-            # TODO will fail on non-yet-flushed data
             bm_bytes = self.pageset.read_at(pageset_id)
             bm = BitMap.deserialize(bm_bytes)
         bm.add(doc_id)
@@ -59,7 +55,6 @@ class DB:
         page_idx = len(self.page) - 1
         self.link[link] = page_idx
         self.update_word_index(fragments, page_idx)
-        self.flush()
 
     def flush(self):
         self.pageset.flush()
@@ -77,7 +72,7 @@ class DB:
                 bm = self.pageset.read_at(ps_id)
                 for offset in BitMap.deserialize(bm):
                     # yield self.page.read_at(offset, 1).decode()
-                    content = self.page.read_at(offset)[:500].decode()
+                    content = self.page.read_at(offset).decode()
                     url, text = content.split('\n', 1)
                     yield '\n' +url
                     yield textwrap.fill(text)
@@ -100,7 +95,6 @@ def crawl(db, start_url):
     # Collect linked pages content
     for item in parser.items:
         for link in (item['link'], item['extra']['comments']):
-            logger.info(f'CRAWL {link}' )
             if link in db.link:
                 continue
             else:
@@ -143,3 +137,4 @@ if __name__ == '__main__':
         db.insert(args.url, list(fragments))
     else:
         exit('Action "%s" not supported' % action)
+    db.flush()

@@ -1,15 +1,17 @@
 from collections import defaultdict, OrderedDict
 from html.parser import HTMLParser
+from http.client import HTTPException
 from itertools import groupby
 from urllib.request import (urlopen, Request, ProxyHandler, install_opener,
                             build_opener)
+from urllib.error import HTTPError, URLError
+
 import gzip
 import io
 import logging
 import os
 import re
 import unicodedata
-import urllib
 
 from dateutil import parser as dateutil_parser
 from rust_fst import Map
@@ -175,6 +177,11 @@ class LogMap:
         return self.read_at(offset)
 
     def read_at(self, offset, nb_line=0):
+        idx_size = self.idx.tell() // 8
+        if offset >= idx_size:
+            value = list(self._log_cache.values())[offset - idx_size]
+            return value
+
         self.idx.seek(offset * 8)
         idx_row = self.idx.read(8)
         log_pos = int.from_bytes(idx_row[:4], 'big', signed=False)
@@ -329,7 +336,7 @@ class TextParser(HTMLParser):
             return open(link)
         try:
             content, resp = get(link)
-        except (urllib.error.HTTPError, urllib.error.URLError):
+        except (HTTPError, URLError, HTTPException, ConnectionError):
             logger.info('Unable to load %s' % link)
             return None
         content_type = resp.headers.get('Content-Type')
